@@ -508,6 +508,7 @@ type PageModelServices = {
     path: string | undefined,
     options: CaptureScreenshotOptions,
     sessionId: string,
+    targetId?: string,
   ): Promise<string>;
   pendingDialog(sessionId: string): Record<string, unknown> | null;
   prepareFileChooser(
@@ -2405,6 +2406,9 @@ class Page {
           ? captureOptions
           : { ...captureOptions, full: fullPage },
         sessionId,
+        // The capture path needs the Page's target to recover from a minimized
+        // window (Browser.getWindowForTarget requires an explicit targetId).
+        page.targetId,
       );
     });
   }

@@ -305,3 +305,205 @@ test("captureScreenshot rejects a relative EGO_BROWSER_OUTPUT_DIR", async () => 
     else globalThis.EGO_BROWSER_OUTPUT_DIR = previous;
   }
 });
+
+// --- Minimized-window recovery -------------------------------------------------
+// Chromium on Windows refuses Page.captureScreenshot while the native window is
+// minimized. The capture path restores the window through the Browser domain and
+// retries once, so agents get their screenshot instead of a lost round.
+
+function withMinimizedWindowRuntime(fn) {
+  const previous = globalThis.ego;
+  const sent = [];
+  let restoreCount = 0;
+  const runtime = {
+    async listTabs() {
+      return {
+        tabs: [
+          {
+            targetId: "target-1",
+            active: true,
+            title: "Example",
+            url: "https://example.com/",
+          },
+        ],
+      };
+    },
+    sendCDPMessage(payload) {
+      const request = JSON.parse(payload);
+      sent.push(request);
+      let result = {};
+      let error;
+      if (request.method === "Target.attachToTarget") {
+        result = { sessionId: "session-1" };
+      } else if (request.method === "Page.captureScreenshot") {
+        // Fail until the window is restored, then succeed — the exact shape of
+        // the real Windows behaviour.
+        if (restoreCount === 0) {
+          error = {
+            code: -32000,
+            message:
+              "Cannot capture a screenshot while the window is minimized.",
+          };
+        } else {
+          result = { data: Buffer.from("png").toString("base64") };
+        }
+      } else if (request.method === "Browser.getWindowForTarget") {
+        result = { windowId: 7, bounds: { windowState: "minimized" } };
+      } else if (request.method === "Browser.setWindowBounds") {
+        restoreCount += 1;
+        result = {};
+      } else if (request.method === "Runtime.evaluate") {
+        result = {
+          result: {
+            value:
+              request.params.expression === "window.devicePixelRatio"
+                ? 1
+                : { w: 800, h: 600, sx: 0, sy: 0, pw: 800, ph: 600 },
+          },
+        };
+      }
+      queueMicrotask(() =>
+        runtime.onCDPMessage(
+          JSON.stringify(
+            error ? { id: request.id, error } : { id: request.id, result },
+          ),
+        ),
+      );
+    },
+    emit(method, params) {
+      runtime.onCDPMessage(
+        JSON.stringify({ sessionId: "session-1", method, params }),
+      );
+    },
+  };
+  globalThis.ego = runtime;
+  invalidateSession();
+  return Promise.resolve()
+    .then(() => fn({ runtime, sent, restored: () => restoreCount }))
+    .finally(() => {
+      invalidateSession();
+      if (previous === undefined) delete globalThis.ego;
+      else globalThis.ego = previous;
+    });
+}
+
+test("captureScreenshot restores a minimized window and retries once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-browser-minimized-test-"));
+  const outputPath = join(root, "page.png");
+  try {
+    await withMinimizedWindowRuntime(async ({ sent, restored }) => {
+      assert.equal(
+        await captureScreenshot(outputPath, {}, undefined, "target-1"),
+        outputPath,
+      );
+      assert.equal(restored(), 1, "window restored exactly once");
+      const methods = sent.map((r) => r.method);
+      assert.deepEqual(
+        methods.filter((m) => m === "Page.captureScreenshot").length,
+        2,
+        "captured twice: failed attempt plus retry",
+      );
+      assert.ok(
+        methods.includes("Browser.getWindowForTarget"),
+        "looked up the window",
+      );
+      assert.ok(
+        methods.includes("Browser.setWindowBounds"),
+        "restored the window",
+      );
+      // The retry must carry the original clip/format options unchanged.
+      const shots = sent.filter((r) => r.method === "Page.captureScreenshot");
+      assert.deepEqual(shots[1].params, shots[0].params);
+    });
+    assert.equal(await readFile(outputPath, "utf8"), "png");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("captureScreenshot without a path falls back to tmpdir", async () => {
+  assert.equal(globalThis.EGO_BROWSER_OUTPUT_DIR, undefined);
+  const restore = setOverrides({ async writeFile() {} });
+  try {
+    await withCdpRuntime(async () => {
+      assert.equal(dirname(await captureScreenshot()), tmpdir());
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("captureScreenshot rejects a relative EGO_BROWSER_OUTPUT_DIR", async () => {
+  const previous = globalThis.EGO_BROWSER_OUTPUT_DIR;
+  globalThis.EGO_BROWSER_OUTPUT_DIR = "shots";
+  const restore = setOverrides({ async writeFile() {} });
+  try {
+    await withCdpRuntime(async () => {
+      await assert.rejects(
+        captureScreenshot(),
+        /EGO_BROWSER_OUTPUT_DIR must be an absolute directory path/,
+      );
+    });
+  } finally {
+    restore();
+    if (previous === undefined) delete globalThis.EGO_BROWSER_OUTPUT_DIR;
+    else globalThis.EGO_BROWSER_OUTPUT_DIR = previous;
+  }
+});
+
+test("captureScreenshot surfaces unrelated screenshot errors unchanged", async () => {
+  const previous = globalThis.ego;
+  const runtime = {
+    async listTabs() {
+      return {
+        tabs: [
+          {
+            targetId: "target-1",
+            active: true,
+            title: "T",
+            url: "https://e.com/",
+          },
+        ],
+      };
+    },
+    sendCDPMessage(payload) {
+      const request = JSON.parse(payload);
+      let result = {};
+      let error;
+      if (request.method === "Target.attachToTarget") {
+        result = { sessionId: "session-1" };
+      } else if (request.method === "Page.captureScreenshot") {
+        error = { code: -32000, message: "Something else went wrong" };
+      } else if (request.method === "Runtime.evaluate") {
+        result = {
+          result: {
+            value:
+              request.params.expression === "window.devicePixelRatio"
+                ? 1
+                : { w: 800, h: 600, sx: 0, sy: 0, pw: 800, ph: 600 },
+          },
+        };
+      }
+      queueMicrotask(() =>
+        runtime.onCDPMessage(
+          JSON.stringify(
+            error ? { id: request.id, error } : { id: request.id, result },
+          ),
+        ),
+      );
+    },
+    emit() {},
+  };
+  globalThis.ego = runtime;
+  invalidateSession();
+  try {
+    await assert.rejects(
+      () => captureScreenshot("/tmp/ego-browser-other-error.png"),
+      /Something else went wrong/,
+    );
+  } finally {
+    invalidateSession();
+    if (previous === undefined) delete globalThis.ego;
+    else globalThis.ego = previous;
+  }
+});

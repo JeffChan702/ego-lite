@@ -369,6 +369,14 @@ keyboard names and `+`-separated chords follow Playwright syntax. Use
 position and resolves when that motion completes. In each script invocation, move or
 click over the intended scrollable area before using it.
 
+`page.screenshot()` needs a visible native window: it captures a compositor
+surface, and a minimized window produces none. When the capture fails for that
+reason the helper restores the window and retries once by itself, so the call
+usually just succeeds. If it still fails, do not retry it in a loop — ask the
+user to restore the ego lite window, or read pixels with
+`canvas.toDataURL("image/png")` for a `<canvas>` target. `Page.printToPDF` stays
+available in that state when the output only needs to be read, not clicked.
+
 On macOS and Windows, `keyboard.paste()` sends the native paste shortcut and
 then restores the user's clipboard. Pass `{ text, html }` when a rich editor
 needs structured clipboard content; `text` is the plain-text fallback. On other

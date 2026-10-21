@@ -124,10 +124,56 @@ function defaultScreenshotPath(): string {
 export async function captureScreenshot(
   path?: string,
   options: CaptureScreenshotOptions = {},
+  targetId?: string,
 ) {
   assertScreenshotScale(options.scale);
   const sessionId = isBrowserRuntime() ? await ensureSession() : undefined;
-  return captureScreenshotForSession(path, options, sessionId);
+  return captureScreenshotForSession(path, options, sessionId, targetId);
+}
+
+// Chromium on Windows refuses to answer Page.captureScreenshot while the native
+// window is minimized ("Cannot capture a screenshot while the window is
+// minimized."). The failure is window state, not page state: the viewport stays
+// non-zero, the DOM keeps answering, printToPDF still works, and the only thing
+// missing is the compositor surface. Minimizing is a state the *user* can put
+// the browser into at any moment, so a capture that silently fails because of it
+// is a lost round for the agent.
+//
+// The window state is reachable from the SDK through the Browser domain, which
+// browser-runtime allows, so recover in place instead of surfacing the raw
+// error: restore the window to `normal`, then capture. A capture that was
+// already going to fail for an unrelated reason still surfaces its own error.
+const MINIMIZED_SCREENSHOT_ERROR = /while the window is minimized/i;
+
+async function restoreFromMinimizedWindow(targetId?: string): Promise<boolean> {
+  let windowId: number | undefined;
+  try {
+    // Browser.getWindowForTarget needs an explicit targetId; without one it
+    // fails with "No web contents in the target". Prefer the caller's target
+    // (a Page knows its own), then the runtime's currently preferred one.
+    const requested = targetId || state.preferredTargetId;
+    const result: any = await cdp(
+      "Browser.getWindowForTarget",
+      requested ? { targetId: requested } : {},
+    );
+    windowId = result?.windowId;
+  } catch {
+    return false;
+  }
+  if (typeof windowId !== "number") return false;
+  try {
+    await cdp("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal" },
+    });
+  } catch {
+    return false;
+  }
+  // The compositor needs a beat to produce a surface again, and the app may
+  // briefly re-validate its session while the window comes back; give both a
+  // moment before the retry so the retry measures the recovered state.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  return true;
 }
 
 /**
@@ -138,6 +184,7 @@ export async function captureScreenshotForSession(
   path?: string,
   options: CaptureScreenshotOptions = {},
   sessionId?: string,
+  targetId?: string,
 ) {
   assertScreenshotScale(options.scale);
   const outputPath = path ?? defaultScreenshotPath();
@@ -200,7 +247,21 @@ export async function captureScreenshotForSession(
       };
     }
   }
-  const result = await cdp("Page.captureScreenshot", params, sessionId);
+  let result;
+  try {
+    result = await cdp("Page.captureScreenshot", params, sessionId);
+  } catch (error) {
+    // A minimized window is a recoverable window state, not a broken page.
+    // Restore the window and retry once; the retry keeps the caller's options,
+    // so a recovered capture is byte-for-byte what the caller asked for.
+    if (!MINIMIZED_SCREENSHOT_ERROR.test(String(error?.message ?? error))) {
+      throw error;
+    }
+    if (!(await restoreFromMinimizedWindow(targetId))) {
+      throw error;
+    }
+    result = await cdp("Page.captureScreenshot", params, sessionId);
+  }
   await mkdir(dirname(outputPath), { recursive: true });
   await state.writeFile(outputPath, Buffer.from(result.data, "base64"));
   return outputPath;
